@@ -1,0 +1,188 @@
+#include <Wire.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WiFiManager.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// Pin Definitions
+#define ONE_WIRE_BUS 4       // DS18B20 Temp Sensor
+#define TDS_PIN 34           // TDS Sensor
+#define TURBIDITY_PIN 35     // Turbidity Sensor
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+WebServer server(80);
+
+String currentWarning = "";
+float lastTemp, lastTDS, lastEC, lastTurb;
+
+void setup() {
+  Serial.begin(115200);
+  sensors.begin();
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED init failed");
+    while (1);
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(10, 10);
+  display.print("Connecting WiFi...");
+  display.display();
+
+  WiFiManager wifiManager;
+  wifiManager.autoConnect("ESP32_Config");
+
+  display.clearDisplay();
+  display.setCursor(10, 10);
+  display.print("IP:");
+  display.setCursor(10, 30);
+  display.print(WiFi.localIP());
+  display.display();
+  delay(3000);
+
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+unsigned long lastUpdate = 0;
+const unsigned long updateInterval = 1000;
+
+void loop() {
+  server.handleClient();
+
+  if (millis() - lastUpdate >= updateInterval) {
+    lastUpdate = millis();
+    updateSensorData();
+    updateDisplay();
+  }
+}
+
+void displayWarning(String warningText) {
+  unsigned long start = millis();
+  while (millis() - start < 2000) {
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setCursor(10, 10);
+    display.println("!ALERT!");
+    display.setCursor(10, 40);
+    display.println(warningText);
+    display.display();
+    delay(250);
+    display.clearDisplay();
+    display.display();
+    delay(250);
+  }
+}
+
+void updateSensorData() {
+  lastTemp = getTemperature();
+  lastTDS = getTDS(lastTemp);
+  lastEC = lastTDS / 0.64;
+  lastTurb = getTurbidity();
+
+  if (lastTemp > 37)
+    currentWarning = "High Temp";
+  else if (lastTDS > 700)
+    currentWarning = "High TDS";
+  else if (lastTurb > 300)
+    currentWarning = "High Turb";
+  else if (lastEC > 1500)
+    currentWarning = "High EC";
+  else
+    currentWarning = "";
+}
+
+void updateDisplay() {
+  if (currentWarning != "") {
+    displayWarning(currentWarning);
+  } else {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(10, 0);
+    display.print("Temp: "); display.print(lastTemp); display.println(" C");
+    display.setCursor(10, 15);
+    display.print("TDS : "); display.print(lastTDS); display.println(" ppm");
+    display.setCursor(10, 30);
+    display.print("EC  : "); display.print(lastEC); display.println(" uS/cm");
+    display.setCursor(10, 45);
+    display.print("Turb: "); display.print(lastTurb); display.println(" %");
+    display.display();
+  }
+}
+
+float getTemperature() {
+  sensors.requestTemperatures();
+  float temp = sensors.getTempCByIndex(0);
+  return (temp == -127) ? 0 : temp;
+}
+
+int getAverageAnalog(int pin, int samples = 10) {
+  long sum = 0;
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(pin);
+    delay(5);
+  }
+  return sum / samples;
+}
+
+float getTDS(float temperature) {
+  int val = getAverageAnalog(TDS_PIN);
+  float voltage = val * (3.3 / 4095.0);
+  float compensationCoefficient = 1.0 + 0.02 * (temperature - 25.0);
+  float compensationVoltage = voltage / compensationCoefficient;
+  float tdsValue = (133.42 * pow(compensationVoltage, 3)
+                  - 255.86 * pow(compensationVoltage, 2)
+                  + 857.39 * compensationVoltage) * 0.5;
+  return tdsValue;
+}
+
+float getTurbidity() {
+  int raw = getAverageAnalog(TURBIDITY_PIN);
+  float voltage = raw * 3.3 / 4095.0;
+  return (voltage >= 3.0) ? 0 : (3.0 - voltage) * 100.0;
+}
+
+void handleRoot() {
+  String html = "<html><head><title>Water Monitor</title>";
+  html += "<style>body{background:#121212;color:white;text-align:center;font-family:Arial;}";
+  html += "h1{color:#00ffcc;} .card{background:#1e1e1e;padding:15px;margin:10px auto;border-radius:10px;box-shadow:0px 0px 15px #00ffcc;width:80%;max-width:400px;}";
+  html += ".value{color:#00ff99;font-weight:bold;font-size:1.5em;}</style>";
+  html += "<script>function updateData(){fetch('/data').then(r=>r.json()).then(d=>{";
+  html += "document.getElementById('temperature').innerHTML=d.temperature+' &deg;C';";
+  html += "document.getElementById('tds').innerHTML=d.tds+' ppm';";
+  html += "document.getElementById('ec').innerHTML=d.ec+' uS/cm';";
+  html += "document.getElementById('turbidity').innerHTML=d.turbidity+' %';";
+  html += "document.getElementById('warning').innerHTML=d.warning;";
+  html += "});} setInterval(updateData, 1000);</script></head><body>";
+  html += "<h1>Water Quality Monitor</h1>";
+  html += "<div class='card'><p class='value' id='warning'>--</p></div>";
+  html += "<div class='card'><p>Temperature</p><p class='value' id='temperature'>--</p></div>";
+  html += "<div class='card'><p>TDS</p><p class='value' id='tds'>--</p></div>";
+  html += "<div class='card'><p>EC</p><p class='value' id='ec'>--</p></div>";
+  html += "<div class='card'><p>Turbidity</p><p class='value' id='turbidity'>--</p></div>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleData() {
+  String json = "{";
+  json += "\"temperature\":" + String(lastTemp) + ",";
+  json += "\"tds\":" + String(lastTDS) + ",";
+  json += "\"ec\":" + String(lastEC) + ",";
+  json += "\"turbidity\":" + String(lastTurb) + ",";
+  json += "\"warning\":\"" + currentWarning + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
